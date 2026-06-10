@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>resumable-stream</title>
+<style>
+  :root{
+    --bg:#0e1726; --panel:#131d30; --line:#243149; --ink:#e7eef6;
+    --muted:#8b9bb4; --teal:#22b8cf; --amber:#e8a13a; --green:#3fb98a; --red:#e06a6a;
+    --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:var(--mono);font-size:13px;line-height:1.55;}
+  .wrap{max-width:820px;margin:0 auto;padding:28px 20px 60px;}
+  h1{font-size:18px;margin:0 0 2px;letter-spacing:.02em;}
+  .sub{color:var(--muted);font-size:12px;margin:0 0 20px;}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:16px;}
+  button{font-family:var(--mono);font-size:12px;color:var(--ink);
+    background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:8px 14px;cursor:pointer;transition:border-color .15s;}
+  button:hover:not(:disabled){border-color:var(--teal);}
+  button:disabled{opacity:.4;cursor:not-allowed;}
+  .pill{font-size:11px;padding:4px 10px;border-radius:20px;border:1px solid var(--line);}
+  .pill.on{color:var(--green);border-color:var(--green);}
+  .pill.off{color:var(--red);border-color:var(--red);}
+  .meta{margin-left:auto;color:var(--muted);font-size:11px;}
+  .meta b{color:var(--teal);}
+  .log{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:8px;height:440px;overflow-y:auto;}
+  .row{display:flex;gap:10px;padding:3px 6px;border-radius:4px;white-space:pre-wrap;}
+  .row:hover{background:rgba(255,255,255,.03);}
+  .seq{color:var(--muted);min-width:46px;text-align:right;}
+  .t{min-width:140px;}
+  .t.lifecycle{color:var(--teal);}
+  .t.progress{color:var(--ink);}
+  .t.stage_started,.t.stage_completed{color:var(--green);}
+  .t.thinking{color:var(--amber);font-style:italic;}
+  .t.control{color:var(--amber);}
+  .pl{color:var(--muted);}
+  .hint{color:var(--muted);font-size:11px;margin-top:12px;line-height:1.7;}
+  .hint b{color:var(--ink);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>resumable-stream</h1>
+  <p class="sub">Start a run, then hit <b>Disconnect</b> mid-stream and <b>Reconnect</b> — it catches up exactly from the last seq, no gaps, no dupes.</p>
+
+  <div class="bar">
+    <button id="new">New run</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <button id="reconnect" disabled>Reconnect (resume)</button>
+    <span id="conn" class="pill off">disconnected</span>
+    <span class="meta">run <b id="runId">—</b> · lastSeen <b id="lastSeen">0</b></span>
+  </div>
+
+  <div id="log" class="log"></div>
+
+  <p class="hint">
+    <b>ephemeral</b> events (amber "thinking") stream live but are never logged — reconnect and you won't see them again.<br>
+    <b>resync_required</b> would appear if this client fell too far behind; it then re-fetches from the cursor.
+  </p>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+
+let runId = null;
+let lastSeen = 0;       // highest durable seq applied — also the resume cursor
+let ws = null;
+
+const LIFECYCLE = new Set(["run_started","run_completed","run_interrupted","run_error"]);
+
+function setConn(on){
+  const el = $("conn");
+  el.textContent = on ? "connected" : "disconnected";
+  el.className = "pill " + (on ? "on" : "off");
+  $("disconnect").disabled = !on;
+  $("reconnect").disabled = on || !runId;
+}
+
+function addRow(ev){
+  const row = document.createElement("div");
+  row.className = "row";
+  const type = ev.type || "?";
+  let cls = "progress";
+  if (LIFECYCLE.has(type)) cls = "lifecycle";
+  else if (type === "thinking") cls = "thinking";
+  else if (type === "stage_started" || type === "stage_completed") cls = type;
+  else if (type === "hydrated" || type === "resync_required") cls = "control";
+  const seq = ev.seq ? ev.seq : (type === "thinking" ? "~" : "");
+  const pl = ev.payload ? JSON.stringify(ev.payload) :
+             (type === "hydrated" ? `latest_seq=${ev.latest_seq}` :
+              type === "resync_required" ? `since_seq=${ev.since_seq}` : "");
+  row.innerHTML = `<span class="seq">${seq}</span>` +
+                  `<span class="t ${cls}">${type}</span>` +
+                  `<span class="pl">${pl}</span>`;
+  logEl.appendChild(row);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// The client-side guard: dedupe durable events on seq > lastSeen.
+function onEvent(ev){
+  if (ev.type === "resync_required"){
+    addRow(ev);
+    // recover: reconnect from the cursor the server handed us
+    lastSeen = ev.since_seq;
+    $("lastSeen").textContent = lastSeen;
+    connect();
+    return;
+  }
+  const ephemeral = !ev.seq;            // ephemeral + control frames carry seq 0
+  if (!ephemeral && ev.seq <= lastSeen) return;   // duplicate → drop
+  addRow(ev);
+  if (!ephemeral){
+    lastSeen = ev.seq;
+    $("lastSeen").textContent = lastSeen;
+  }
+}
+
+function connect(){
+  if (ws) { ws.onclose = null; ws.close(); }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/runs/${runId}/stream?since_seq=${lastSeen}`);
+  ws.onopen = () => setConn(true);
+  ws.onmessage = (m) => onEvent(JSON.parse(m.data));
+  ws.onclose = () => setConn(false);
+}
+
+$("new").onclick = async () => {
+  const res = await fetch("/runs", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+  runId = (await res.json()).run_id;
+  lastSeen = 0;
+  logEl.innerHTML = "";
+  $("runId").textContent = runId;
+  $("lastSeen").textContent = "0";
+  connect();
+};
+
+$("disconnect").onclick = () => { if (ws){ ws.onclose=null; ws.close(); setConn(false); } };
+$("reconnect").onclick = () => connect();
+</script>
+</body>
+</html>
