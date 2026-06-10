@@ -1,0 +1,26 @@
+[project]
+name = "resumable-stream"
+version = "0.1.0"
+description = "A resumable job-streaming server: durable event log, cursor-based WebSocket resume, backpressure, and crash recovery."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "websockets>=12.0",
+]
+
+[tool.pytest.ini_options]
+# asyncio_mode=auto lets `async def test_*` run without per-test decorators.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
